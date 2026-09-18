@@ -29,3 +29,4 @@ bind-key X run-shell -b 'pomo stop >/dev/null 2>&1'
 Reload tmux with `tmux source-file ~/.tmux.conf`.
 
 `p` replaces tmux's default previous-window binding; use `T` for a custom duration.
+At zero, pomo rings the terminal bell and shows a tmux completion message once.

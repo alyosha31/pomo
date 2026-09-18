@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -12,6 +13,41 @@ type timerState struct {
 	End       int64 `json:"end"`
 	Paused    bool  `json:"paused"`
 	Remaining int64 `json:"remaining,omitempty"`
+	Notified  bool  `json:"notified,omitempty"`
+}
+
+// claimCompletion returns true exactly once for a completed timer, even when
+// several tmux clients refresh the status line at the same time.
+func claimCompletion(now time.Time) (bool, error) {
+	path, err := statePath()
+	if err != nil {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, err
+	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return false, err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	s, err := loadState()
+	if err != nil {
+		return false, err
+	}
+	if s.remaining(now) > 0 || s.Notified {
+		return false, nil
+	}
+	s.Notified = true
+	if err := saveState(s); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func newRunningState(d time.Duration, now time.Time) timerState {

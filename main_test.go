@@ -48,3 +48,25 @@ func TestPausedRemaining(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestCompletionClaimedOnce(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	s := newRunningState(time.Second, time.Now().Add(-2*time.Second))
+	if err := saveState(s); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := claimCompletion(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("first completion was not claimed")
+	}
+	claimed, err = claimCompletion(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("completion was claimed twice")
+	}
+}

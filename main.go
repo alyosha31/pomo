@@ -103,6 +103,13 @@ func printStatus(short bool) error {
 	}
 	remaining := s.remaining(time.Now())
 	if remaining <= 0 {
+		claimed, err := claimCompletion(time.Now())
+		if err != nil {
+			return err
+		}
+		if claimed {
+			notifyTmux()
+		}
 		if short {
 			fmt.Print("🍅 done")
 		} else {
