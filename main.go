@@ -11,7 +11,7 @@ import (
 const usage = `pomo - a tiny terminal Pomodoro timer
 
 Usage:
-  pomo [MINUTES]       Run a live foreground timer (default: 25)
+  pomo [MINUTES]       Run a live foreground timer (default: 40)
   pomo start [MINUTES] Start a timer and return immediately
   pomo status [--short]
   pomo toggle          Pause or resume
@@ -26,9 +26,11 @@ func main() {
 	}
 }
 
+const defaultFocusDuration = 40 * time.Minute
+
 func run(args []string) error {
 	if len(args) == 0 {
-		return runForeground(25 * time.Minute)
+		return runForeground(defaultFocusDuration)
 	}
 
 	switch args[0] {
@@ -71,7 +73,7 @@ func run(args []string) error {
 
 func durationArg(args []string) (time.Duration, error) {
 	if len(args) == 0 {
-		return 25 * time.Minute, nil
+		return defaultFocusDuration, nil
 	}
 	if len(args) != 1 {
 		return 0, errors.New("usage: pomo start [MINUTES]")
