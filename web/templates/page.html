@@ -1,0 +1,243 @@
+{{define "head"}}
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>pomo</title>
+<link rel="icon" href="/static/favicon.svg?v={{.Version}}" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css?v={{.Version}}">
+{{end}}
+
+{{define "page"}}<!doctype html>
+<html lang="en">
+<head>
+{{template "head" .}}
+<script src="/static/vendor/htmx.min.js?v={{.Version}}" defer></script>
+<script src="/static/vendor/Sortable.min.js?v={{.Version}}" defer></script>
+<script src="/static/app.js?v={{.Version}}" defer></script>
+</head>
+<body hx-swap="none">
+<header class="topbar">
+  <div class="brand"><span class="brand-dot"></span>pomo</div>
+  <div class="topbar-right">
+    {{template "today" .}}
+    <button type="button" class="icon-btn" onclick="document.getElementById('settings').showModal()" aria-label="Settings" title="Settings">
+      <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+    </button>
+    {{if .AuthRequired}}
+    <form method="post" action="/logout" hx-boost="false">
+      <button class="icon-btn" aria-label="Log out" title="Log out">
+        <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+      </button>
+    </form>
+    {{end}}
+  </div>
+</header>
+
+<main class="layout">
+  <section class="side">
+    {{template "timer" .}}
+    <form class="card composer" hx-post="/plan" hx-disabled-elt="find button"
+          hx-on::after-request="if (event.detail.successful) this.reset()">
+      <label for="dump" class="label">What's on your plate?</label>
+      <textarea id="dump" name="text" rows="6" placeholder="Everything you need to get done, in any order. e.g. “finish the Q3 deck before Friday, probably a couple hours. reply to Sam about the contract. quick: book dentist”"></textarea>
+      <div class="composer-row">
+        <span class="hint planning">Planning with {{.Planner}}…</span>
+        <span class="hint idle-hint">Ctrl+Enter</span>
+        <button class="btn primary">Plan tasks</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="main">
+    {{template "queue" .}}
+  </section>
+</main>
+
+<dialog id="settings" class="dialog">{{template "settings" .}}</dialog>
+<div id="toasts" class="toasts" aria-live="polite">{{range .Toasts}}{{template "toast" .}}{{end}}</div>
+<div hidden hx-get="/board" hx-trigger="every 30s [!pomoBusy()], visibilitychange[document.visibilityState === 'visible'] from:document"></div>
+</body>
+</html>
+{{end}}
+
+{{define "board"}}
+{{template "timer" .}}
+{{template "queue" .}}
+{{template "today" .}}
+<div id="toasts" hx-swap-oob="beforeend">{{range .Toasts}}{{template "toast" .}}{{end}}</div>
+{{end}}
+
+{{define "toast"}}<div class="toast {{.Kind}}"><span>{{.Text}}</span></div>{{end}}
+
+{{define "today"}}
+<span id="today" class="today" title="Pomodoros finished today" {{if .OOB}}hx-swap-oob="true"{{end}}><b>{{.Today}}</b> today</span>
+{{end}}
+
+{{define "timer"}}{{$t := .Timer}}
+<div id="timer" class="card timer-card{{if $t.NotStarted}} not-started{{end}}" {{if .OOB}}hx-swap-oob="true"{{end}}
+     data-phase="{{$t.Phase}}" data-ends="{{$t.EndsAt}}" data-remaining="{{$t.Remaining}}" data-duration="{{$t.Duration}}"
+     data-running="{{$t.Running}}" data-sound="{{$t.Sound}}">
+  <div class="phase-pill">{{$t.Label}}</div>
+  <div class="ring-wrap">
+    <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
+      <circle class="ring-track" cx="60" cy="60" r="54"/>
+      <circle class="ring-fill" cx="60" cy="60" r="54"/>
+    </svg>
+    <div class="ring-center">
+      <div class="clock">{{$t.Clock}}</div>
+      <div class="clock-sub">{{$t.Sub}}</div>
+    </div>
+  </div>
+  <div class="current">{{$t.Title}}</div>
+  <div class="controls">
+    <button type="button" class="btn ghost" hx-post="/timer/reset" {{if eq $t.Phase "idle"}}disabled{{end}} title="Stop and reset">Reset</button>
+    <button type="button" class="btn primary big" id="toggle" hx-post="/timer/toggle">{{$t.Toggle}}</button>
+    <button type="button" class="btn ghost" hx-post="/timer/skip" {{if eq $t.Phase "idle"}}disabled{{end}} title="Skip to what's next">Skip</button>
+  </div>
+</div>
+{{end}}
+
+{{define "queue"}}
+<div id="queue" {{if .OOB}}hx-swap-oob="true"{{end}}>
+  <div class="list-head">
+    <div>
+      <h2>Queue</h2>
+      {{with .Summary}}{{if .Tasks}}
+      <div class="summary"><b>{{.Tasks}}</b> task{{if ne .Tasks 1}}s{{end}} · <b>{{.Pomos}}</b> pomodoro{{if ne .Pomos 1}}s{{end}} · {{duration .Minutes}} · done ≈ <b data-eta-min="{{.Minutes}}"></b></div>
+      {{end}}{{end}}
+    </div>
+    <button type="button" class="btn ghost small" hx-post="/items/new">+ Add task</button>
+  </div>
+
+  {{if .Open}}
+  <div class="items" id="items" hx-post="/order" hx-trigger="end" hx-include="#items input[name='id']">
+    {{range .Open}}{{template "item" .}}{{end}}
+  </div>
+  {{else}}
+  <div class="empty">
+    <p>Nothing in the queue.</p>
+    <p class="muted">Type everything that's on your mind into the box. It gets split into tasks, each estimated in pomodoros. Add breaks between tasks with <b>+ break</b>.</p>
+  </div>
+  {{end}}
+
+  {{if .Done}}
+  <details class="done-section">
+    <summary>Done ({{len .Done}})</summary>
+    <div class="items done-list">
+      {{range .Done}}{{template "item" .}}{{end}}
+    </div>
+    <button type="button" class="btn ghost small" hx-post="/clear-done">Clear done</button>
+  </details>
+  {{end}}
+</div>
+{{end}}
+
+{{define "item"}}
+{{if .IsBreak}}
+<div class="item break{{if .Active}} active{{end}}{{if .Fresh}} fresh{{end}}" data-id="{{.ID}}">
+  <input type="hidden" name="id" value="{{.ID}}">
+  <span class="handle" title="Drag to reorder">{{template "grip"}}</span>
+  <span class="break-icon"><svg viewBox="0 0 24 24"><path d="M4 9h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5zM17 10h1.5a2.5 2.5 0 0 1 0 5H17M8 3v3M12 3v3"/></svg></span>
+  <div class="body">
+    <div class="title">Break</div>
+    <div class="meta">
+      <span class="stepper">
+        <button type="button" hx-post="/items/{{.ID}}/minutes?delta=-5" aria-label="5 minutes shorter">−</button>
+        <span>{{.BreakMin}} min</span>
+        <button type="button" hx-post="/items/{{.ID}}/minutes?delta=5" aria-label="5 minutes longer">+</button>
+      </span>
+    </div>
+  </div>
+  <div class="actions">
+    <button type="button" class="icon-btn play-btn" hx-post="/items/{{.ID}}/focus" title="Take this break now" aria-label="Take this break now">{{template "play"}}</button>
+    <button type="button" class="icon-btn del-btn" hx-post="/items/{{.ID}}/delete" title="Remove break" aria-label="Remove break">{{template "trash"}}</button>
+  </div>
+</div>
+{{else}}
+<div class="item task{{if .Done}} done{{end}}{{if .Active}} active{{end}}{{if .Fresh}} fresh{{end}}{{if .Editing}} editing{{end}}" data-id="{{.ID}}">
+  {{if not .Done}}<input type="hidden" name="id" value="{{.ID}}">{{end}}
+  {{if .Done}}<span></span>{{else}}<span class="handle" title="Drag to reorder">{{template "grip"}}</span>{{end}}
+  <button type="button" class="check" hx-post="/items/{{.ID}}/done" title="{{if .Done}}Mark not done{{else}}Mark done{{end}}" aria-label="{{if .Done}}Mark not done{{else}}Mark done{{end}}">
+    <svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+  </button>
+  <div class="body">
+    {{if .Editing}}
+    <form class="edit-form" hx-post="/items/{{.ID}}" hx-on:keydown="if (event.key === 'Escape') htmx.ajax('GET', '/board', {swap: 'none'}); if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) this.requestSubmit()">
+      <input name="title" value="{{.Title}}" maxlength="140" required autofocus>
+      <textarea name="notes" rows="2" maxlength="500" placeholder="Notes">{{.Notes}}</textarea>
+      <div class="edit-actions">
+        <button type="button" class="btn ghost small" hx-get="/board">Cancel</button>
+        <button class="btn primary small">Save</button>
+      </div>
+    </form>
+    {{else}}
+    <div class="title" {{if not .Done}}hx-get="/items/{{.ID}}/edit" hx-target="closest .item" hx-swap="outerHTML" title="Click to edit"{{end}}>{{.Title}}</div>
+    {{if .Notes}}<div class="notes">{{.Notes}}</div>{{end}}
+    <div class="meta">
+      <span class="dots">{{range .Dots}}<span class="{{.}}"></span>{{end}}</span>
+      {{if not .Done}}
+      <span class="stepper">
+        <button type="button" hx-post="/items/{{.ID}}/pomodoros?delta=-1" aria-label="One fewer pomodoro">−</button>
+        <span>{{.Pomodoros}}</span>
+        <button type="button" hx-post="/items/{{.ID}}/pomodoros?delta=1" aria-label="One more pomodoro">+</button>
+      </span>
+      {{end}}
+      <span>{{duration .Minutes}}</span>
+      {{if not .Done}}
+        {{if eq .Source "ai"}}<span class="badge" title="Estimated by AI">AI est.</span>{{end}}
+        {{if eq .Source "default"}}<span class="badge guess" title="No estimate could be inferred — set one">set estimate</span>{{end}}
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+  <div class="actions">
+    {{if not .Done}}<button type="button" class="icon-btn play-btn" hx-post="/items/{{.ID}}/focus" title="Focus on this now" aria-label="Focus on this now">{{template "play"}}</button>{{end}}
+    <button type="button" class="icon-btn del-btn" hx-post="/items/{{.ID}}/delete" title="Delete" aria-label="Delete">{{template "trash"}}</button>
+  </div>
+  {{if and (not .Done) (not .Last)}}
+  <button type="button" class="add-break" hx-post="/items/{{.ID}}/break-after" title="Add a break after this task">+ break</button>
+  {{end}}
+</div>
+{{end}}
+{{end}}
+
+{{define "settings"}}
+<form id="settings-form" hx-post="/settings" hx-on::after-request="if (event.detail.successful) this.closest('dialog').close()">
+  <h3>Settings</h3>
+  <div class="grid3">
+    <label>Focus<input type="number" name="workMin" min="1" max="180" value="{{.Settings.WorkMin}}" required><span>min</span></label>
+    <label>Short break<input type="number" name="shortMin" min="1" max="60" value="{{.Settings.ShortMin}}" required><span>min</span></label>
+    <label>Queue break<input type="number" name="breakMin" min="1" max="120" value="{{.Settings.BreakMin}}" required><span>min</span></label>
+  </div>
+  <p class="muted small-text">Short breaks run automatically between pomodoros of the same task. Queue breaks are the ones you add with <b>+ break</b>; this is their starting length.</p>
+  <label class="switch"><input type="checkbox" name="autoBreaks" value="1" {{if .Settings.AutoBreaks}}checked{{end}}> Start breaks automatically</label>
+  <label class="switch"><input type="checkbox" name="autoWork" value="1" {{if .Settings.AutoWork}}checked{{end}}> Start the next pomodoro automatically</label>
+  <label class="switch"><input type="checkbox" name="sound" value="1" {{if .Settings.Sound}}checked{{end}}> Chime when a phase ends</label>
+  <p class="muted small-text">Tasks are planned by the <b>{{.Planner}}</b> CLI on the server.</p>
+  <div class="dialog-actions">
+    <button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button>
+    <button class="btn primary">Save</button>
+  </div>
+</form>
+{{end}}
+
+{{define "login"}}<!doctype html>
+<html lang="en">
+<head>{{template "head" .}}</head>
+<body>
+<div class="login">
+  <form class="card login-card" method="post" action="/login">
+    <div class="brand"><span class="brand-dot"></span>pomo</div>
+    <label for="password" class="label">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+    <button class="btn primary">Log in</button>
+    {{with .Error}}<p class="error">{{.}}</p>{{end}}
+  </form>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "grip"}}<svg viewBox="0 0 24 24"><circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/></svg>{{end}}
+{{define "play"}}<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></svg>{{end}}
+{{define "trash"}}<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>{{end}}

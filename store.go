@@ -19,51 +19,68 @@ const (
 	SourceManual  = "manual"  // set by the user
 )
 
-type Task struct {
+// Item kinds. The queue mixes tasks and breaks; the timer works through it
+// top to bottom.
+const (
+	KindTask  = "task"
+	KindBreak = "break"
+)
+
+type Item struct {
 	ID        string     `json:"id"`
+	Kind      string     `json:"kind"`
 	Title     string     `json:"title"`
 	Notes     string     `json:"notes"`
 	Pomodoros int        `json:"pomodoros"`
 	Completed int        `json:"completed"`
 	Source    string     `json:"source"`
+	BreakMin  int        `json:"breakMin,omitempty"`
 	Done      bool       `json:"done"`
 	CreatedAt time.Time  `json:"createdAt"`
 	DoneAt    *time.Time `json:"doneAt,omitempty"`
 }
 
-// Timer is driven by the browser; the server only persists it so a refresh
-// or a second device picks up where the session left off.
+func (it Item) IsBreak() bool { return it.Kind == KindBreak }
+
+// Timer phases.
+const (
+	PhaseIdle  = "idle"
+	PhaseWork  = "work"  // a pomodoro of a task
+	PhaseShort = "short" // automatic break between pomodoros of one task
+	PhaseBreak = "break" // a break item from the queue
+)
+
 type Timer struct {
-	Phase     string `json:"phase"` // idle | work | short | long
-	TaskID    string `json:"taskId"`
+	Phase     string `json:"phase"`
+	ItemID    string `json:"itemId"`
 	Duration  int64  `json:"duration"`  // ms
 	EndsAt    int64  `json:"endsAt"`    // unix ms while running, 0 while paused
 	Remaining int64  `json:"remaining"` // ms left while paused
-	AskDone   bool   `json:"askDone"`   // last planned pomodoro of the task just finished
 }
+
+func (t Timer) Running() bool { return t.Phase != PhaseIdle && t.EndsAt > 0 }
 
 type Settings struct {
 	WorkMin    int  `json:"workMin"`
-	ShortMin   int  `json:"shortMin"`
-	LongMin    int  `json:"longMin"`
+	ShortMin   int  `json:"shortMin"` // between pomodoros of the same task
+	BreakMin   int  `json:"breakMin"` // default length of a break added to the queue
 	AutoBreaks bool `json:"autoBreaks"`
 	AutoWork   bool `json:"autoWork"`
 	Sound      bool `json:"sound"`
 }
 
 type State struct {
-	Tasks      []Task         `json:"tasks"`
-	Timer      Timer          `json:"timer"`
-	Settings   Settings       `json:"settings"`
-	Stats      map[string]int `json:"stats"` // YYYY-MM-DD -> pomodoros finished
-	LastCredit int64          `json:"lastCredit"`
+	Items    []Item         `json:"items"`
+	Timer    Timer          `json:"timer"`
+	Settings Settings       `json:"settings"`
+	Stats    map[string]int `json:"stats"` // YYYY-MM-DD -> pomodoros finished
 }
 
 func defaultState() State {
 	return State{
-		Tasks:    []Task{},
-		Timer:    Timer{Phase: "idle"},
-		Settings: Settings{WorkMin: 25, ShortMin: 5, LongMin: 15, AutoBreaks: true, Sound: true},
+		Items:    []Item{},
+		Timer:    Timer{Phase: PhaseIdle},
+		Settings: Settings{WorkMin: 25, ShortMin: 5, BreakMin: 5, AutoBreaks: true, Sound: true},
 		Stats:    map[string]int{},
 	}
 }
@@ -74,54 +91,75 @@ func (s Settings) Validate() error {
 		return errors.New("focus length must be 1-180 minutes")
 	case s.ShortMin < 1 || s.ShortMin > 60:
 		return errors.New("short break must be 1-60 minutes")
-	case s.LongMin < 1 || s.LongMin > 120:
-		return errors.New("long break must be 1-120 minutes")
+	case s.BreakMin < 1 || s.BreakMin > 120:
+		return errors.New("default break must be 1-120 minutes")
 	}
 	return nil
 }
 
-func (t Timer) Validate() error {
-	switch t.Phase {
-	case "idle", "work", "short", "long":
-	default:
-		return fmt.Errorf("unknown phase %q", t.Phase)
-	}
-	if t.Duration < 0 || t.EndsAt < 0 || t.Remaining < 0 {
-		return errors.New("timer values must not be negative")
-	}
-	return nil
-}
-
-func (st *State) task(id string) *Task {
-	for i := range st.Tasks {
-		if st.Tasks[i].ID == id {
-			return &st.Tasks[i]
+func (st *State) item(id string) *Item {
+	for i := range st.Items {
+		if st.Items[i].ID == id {
+			return &st.Items[i]
 		}
 	}
 	return nil
 }
 
-// Reorder puts the given ids first, in order; tasks not mentioned keep
+func (st *State) index(id string) int {
+	for i := range st.Items {
+		if st.Items[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (st *State) remove(id string) bool {
+	if i := st.index(id); i >= 0 {
+		st.Items = append(st.Items[:i], st.Items[i+1:]...)
+		return true
+	}
+	return false
+}
+
+func (st *State) insert(i int, it Item) {
+	i = max(0, min(i, len(st.Items)))
+	st.Items = append(st.Items[:i], append([]Item{it}, st.Items[i:]...)...)
+}
+
+// Open returns the queue: items not done yet, in order.
+func (st *State) Open() []Item {
+	var out []Item
+	for _, it := range st.Items {
+		if !it.Done {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// Reorder puts the given ids first, in order; items not mentioned keep
 // their relative order after them.
 func (st *State) Reorder(ids []string) {
-	byID := make(map[string]Task, len(st.Tasks))
-	for _, t := range st.Tasks {
-		byID[t.ID] = t
+	byID := make(map[string]Item, len(st.Items))
+	for _, it := range st.Items {
+		byID[it.ID] = it
 	}
-	out := make([]Task, 0, len(st.Tasks))
+	out := make([]Item, 0, len(st.Items))
 	seen := map[string]bool{}
 	for _, id := range ids {
-		if t, ok := byID[id]; ok && !seen[id] {
-			out = append(out, t)
+		if it, ok := byID[id]; ok && !seen[id] {
+			out = append(out, it)
 			seen[id] = true
 		}
 	}
-	for _, t := range st.Tasks {
-		if !seen[t.ID] {
-			out = append(out, t)
+	for _, it := range st.Items {
+		if !seen[it.ID] {
+			out = append(out, it)
 		}
 	}
-	st.Tasks = out
+	st.Items = out
 }
 
 func newID() string {
@@ -154,20 +192,45 @@ func OpenStore(path string) (*Store, error) {
 		if err := json.Unmarshal(data, &st); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
+		migrate(&st, data)
 	}
-	if st.Tasks == nil {
-		st.Tasks = []Task{}
+	if st.Items == nil {
+		st.Items = []Item{}
 	}
 	if st.Stats == nil {
 		st.Stats = map[string]int{}
 	}
+	if st.Settings.BreakMin == 0 {
+		st.Settings.BreakMin = 5
+	}
 	if st.Settings.Validate() != nil {
 		st.Settings = defaultState().Settings
 	}
-	if st.Timer.Validate() != nil {
-		st.Timer = Timer{Phase: "idle"}
+	switch st.Timer.Phase {
+	case PhaseWork, PhaseShort, PhaseBreak:
+		if st.item(st.Timer.ItemID) == nil {
+			st.Timer = Timer{Phase: PhaseIdle}
+		}
+	default:
+		st.Timer = Timer{Phase: PhaseIdle}
 	}
 	return &Store{path: path, state: st}, nil
+}
+
+// migrate carries tasks over from the first version, which stored them
+// under "tasks" with no kind.
+func migrate(st *State, data []byte) {
+	var old struct {
+		Tasks []Item `json:"tasks"`
+	}
+	if json.Unmarshal(data, &old) == nil && len(st.Items) == 0 {
+		st.Items = old.Tasks
+	}
+	for i := range st.Items {
+		if st.Items[i].Kind == "" {
+			st.Items[i].Kind = KindTask
+		}
+	}
 }
 
 func (s *Store) Snapshot() State {

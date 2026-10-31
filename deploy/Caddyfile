@@ -1,6 +1,6 @@
 # Caddy fetches and renews the HTTPS certificate on its own. HTTPS is
-# required for the microphone (voice dictation) and notifications.
-pomo.example.com {
+# keeps the password private and is required for browser notifications.
+pomo.alyosha313.tech {
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:8080
 }

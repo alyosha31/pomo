@@ -1,6 +1,6 @@
-// Command pomo is a self-hosted Pomodoro planner: dump your tasks by voice
-// or text, let Claude (or Codex) turn them into estimated tasks, then work
-// through them with a focus/break timer.
+// Command pomo is a self-hosted Pomodoro planner: dump your tasks as text,
+// let Claude (or Codex) turn them into estimated tasks, then work through
+// the queue with a focus/break timer.
 package main
 
 import (
@@ -60,7 +60,10 @@ func main() {
 		log.Printf("WARNING: listening on %s with no POMO_PASSWORD; anyone who can reach it can run your AI CLI", *addr)
 	}
 
-	srv := &Server{store: store, planner: NewPlanner(*provider, *model), auth: auth, web: web}
+	srv, err := NewServer(store, NewPlanner(*provider, *model), auth, web)
+	if err != nil {
+		log.Fatal(err)
+	}
 	log.Printf("pomo on http://%s (planner: %s, data: %s)", *addr, srv.planner.Name(), *data)
 	hs := &http.Server{
 		Addr:              *addr,

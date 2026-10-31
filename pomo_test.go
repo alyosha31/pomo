@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 )
 
@@ -75,41 +75,130 @@ func TestClaudePlanner(t *testing.T) {
 }
 
 func TestReorder(t *testing.T) {
-	st := State{Tasks: []Task{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}}}
+	st := State{Items: []Item{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}}}
 	st.Reorder([]string{"c", "a", "zz", "c"})
 	var ids []string
-	for _, t := range st.Tasks {
-		ids = append(ids, t.ID)
+	for _, it := range st.Items {
+		ids = append(ids, it.ID)
 	}
 	if strings.Join(ids, "") != "cabd" {
 		t.Errorf("got %v", ids)
 	}
 }
 
-func TestStorePersists(t *testing.T) {
+func TestStorePersistsAndMigrates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
+	old := `{"tasks":[{"id":"x","title":"Old task","pomodoros":2}],"timer":{"phase":"long"},"settings":{"workMin":30,"shortMin":5,"longMin":15}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	s, err := OpenStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Update(func(st *State) error {
-		st.Tasks = append(st.Tasks, Task{ID: "x", Title: "Persist me"})
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	st := s.Snapshot()
+	if len(st.Items) != 1 || st.Items[0].Kind != KindTask || st.Timer.Phase != PhaseIdle || st.Settings.WorkMin != 30 || st.Settings.BreakMin != 5 {
+		t.Fatalf("migration: %+v", st)
 	}
 	if _, err := s.Update(func(st *State) error {
-		st.Tasks = nil
+		st.Items = nil
 		return errors.New("nope")
 	}); err == nil {
 		t.Fatal("expected error")
 	}
-	s2, err := OpenStore(path)
-	if err != nil {
+	if _, err := s.Update(func(st *State) error { st.Items[0].Title = "Saved"; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if got := s2.Snapshot().Tasks; len(got) != 1 || got[0].Title != "Persist me" {
+	s2, _ := OpenStore(path)
+	if got := s2.Snapshot().Items; len(got) != 1 || got[0].Title != "Saved" {
 		t.Errorf("got %+v", got)
+	}
+}
+
+func queueState() *State {
+	st := defaultState()
+	st.Items = []Item{
+		{ID: "a", Kind: KindTask, Title: "A", Pomodoros: 2},
+		{ID: "b1", Kind: KindBreak, BreakMin: 10},
+		{ID: "c", Kind: KindTask, Title: "C", Pomodoros: 1},
+	}
+	return &st
+}
+
+const minute = int64(60_000)
+
+func TestTimerWalksTheQueue(t *testing.T) {
+	st := queueState()
+	if err := st.Toggle(0); err != nil {
+		t.Fatal(err)
+	}
+	if st.Timer.Phase != PhaseWork || st.Timer.ItemID != "a" || st.Timer.EndsAt != 25*minute {
+		t.Fatalf("start: %+v", st.Timer)
+	}
+	// first pomodoro of A ends: short break starts on its own
+	st.Advance(25 * minute)
+	if st.Timer.Phase != PhaseShort || !st.Timer.Running() || st.Items[0].Completed != 1 {
+		t.Fatalf("after pomodoro 1: %+v", st.Timer)
+	}
+	// short break ends: next pomodoro waits for Start (autoWork off)
+	st.Advance(30 * minute)
+	if st.Timer.Phase != PhaseWork || st.Timer.Running() {
+		t.Fatalf("after short break: %+v", st.Timer)
+	}
+	st.Toggle(31 * minute)
+	// A's last pomodoro ends: A done, the break item starts on its own
+	st.Advance(56 * minute)
+	if !st.Items[0].Done || st.Timer.Phase != PhaseBreak || st.Timer.ItemID != "b1" || st.Timer.Duration != 10*minute || !st.Timer.Running() {
+		t.Fatalf("after A: %+v items %+v", st.Timer, st.Items)
+	}
+	// break ends: break removed, C loaded but not started
+	st.Advance(66 * minute)
+	if st.item("b1") != nil || st.Timer.ItemID != "c" || st.Timer.Running() {
+		t.Fatalf("after break: %+v", st.Timer)
+	}
+	if st.Stats[time.UnixMilli(0).Format(time.DateOnly)] != 2 {
+		t.Errorf("stats: %v", st.Stats)
+	}
+}
+
+func TestAdvanceCatchesUpSeveralPhases(t *testing.T) {
+	st := queueState()
+	st.Settings.AutoWork = true
+	st.Toggle(0)
+	// everything runs on its own: A(25) short(5) A(25) break(10) C(25)
+	st.Advance(200 * minute)
+	if st.Timer.Phase != PhaseIdle || len(st.Open()) != 0 {
+		t.Fatalf("expected the whole queue done: %+v %+v", st.Timer, st.Items)
+	}
+}
+
+func TestSkipPauseAndLeaving(t *testing.T) {
+	st := queueState()
+	st.Toggle(0)
+	st.Toggle(10 * minute) // pause
+	if st.Timer.Running() || st.Timer.Remaining != 15*minute {
+		t.Fatalf("pause: %+v", st.Timer)
+	}
+	st.Skip(11 * minute) // skipped pomodoro doesn't count
+	if st.Items[0].Completed != 0 || st.Timer.Phase != PhaseShort {
+		t.Fatalf("skip: %+v %+v", st.Timer, st.Items[0])
+	}
+	// deleting the item the timer is on moves to the next one, unstarted
+	st.leaving("a", 12*minute, func() { st.remove("a") })
+	if st.Timer.ItemID != "b1" || st.Timer.Running() {
+		t.Fatalf("leaving: %+v", st.Timer)
+	}
+	if err := st.FocusNow("c", 13*minute); err != nil || st.Items[0].ID != "c" || !st.Timer.Running() {
+		t.Fatalf("focus now: %+v %+v", st.Timer, st.Items)
+	}
+}
+
+func TestQueueSummary(t *testing.T) {
+	st := queueState()
+	sm := queueSummary(st, st.Open(), 0)
+	// A: 2×25 + 5, break 10, C: 25
+	if sm.Tasks != 2 || sm.Pomos != 3 || sm.Minutes != 90 {
+		t.Errorf("got %+v", sm)
 	}
 }
 
@@ -123,7 +212,7 @@ func (f fakePlanner) Plan(context.Context, PlanRequest) ([]PlannedTask, error) {
 	return f.tasks, f.err
 }
 
-func newTestServer(t *testing.T, password string, p Planner) http.Handler {
+func newTestServer(t *testing.T, password string, p Planner) (*Server, http.Handler) {
 	t.Helper()
 	dir := t.TempDir()
 	store, err := OpenStore(filepath.Join(dir, "state.json"))
@@ -134,13 +223,21 @@ func newTestServer(t *testing.T, password string, p Planner) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	web := fstest.MapFS{"index.html": {Data: []byte("<html>")}}
-	return (&Server{store: store, planner: p, auth: auth, web: web}).Handler()
+	web, _ := fs.Sub(webFiles, "web")
+	srv, err := NewServer(store, p, auth, web)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, srv.Handler()
 }
 
-func do(t *testing.T, h http.Handler, method, path, body string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+func do(t *testing.T, h http.Handler, method, path, form string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req := httptest.NewRequest(method, path, strings.NewReader(form))
+	if form != "" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	req.Header.Set("HX-Request", "true")
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}
@@ -149,37 +246,36 @@ func do(t *testing.T, h http.Handler, method, path, body string, cookies ...*htt
 	return rec
 }
 
-func decodeState(t *testing.T, rec *httptest.ResponseRecorder) State {
-	t.Helper()
-	var out struct{ State State }
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("decode %q: %v", rec.Body.String(), err)
-	}
-	return out.State
-}
-
 func TestAuth(t *testing.T) {
-	h := newTestServer(t, "hunter2", SimplePlanner{})
-	if rec := do(t, h, "GET", "/api/state", ""); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated state: %d", rec.Code)
+	_, h := newTestServer(t, "hunter2", SimplePlanner{})
+	if rec := do(t, h, "GET", "/board", ""); rec.Code != http.StatusUnauthorized || rec.Header().Get("HX-Redirect") != "/login" {
+		t.Fatalf("unauthenticated board: %d", rec.Code)
 	}
-	if rec := do(t, h, "GET", "/", ""); rec.Code != http.StatusOK {
+	if rec := do(t, h, "GET", "/static/app.css", ""); rec.Code != http.StatusOK {
 		t.Fatalf("static files should be public: %d", rec.Code)
 	}
-	if rec := do(t, h, "POST", "/api/login", `{"password":"wrong"}`); rec.Code != http.StatusUnauthorized {
+	if rec := do(t, h, "POST", "/login", "password=wrong"); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong password: %d", rec.Code)
 	}
-	rec := do(t, h, "POST", "/api/login", `{"password":"hunter2"}`)
+	rec := do(t, h, "POST", "/login", "password=hunter2")
 	cookies := rec.Result().Cookies()
-	if rec.Code != http.StatusOK || len(cookies) != 1 {
+	if rec.Code != http.StatusSeeOther || len(cookies) != 1 {
 		t.Fatalf("login: %d %v", rec.Code, cookies)
 	}
-	if rec := do(t, h, "GET", "/api/state", "", cookies[0]); rec.Code != http.StatusOK {
-		t.Fatalf("authenticated state: %d", rec.Code)
+	if rec := do(t, h, "GET", "/", "", cookies[0]); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `id="timer"`) {
+		t.Fatalf("index: %d", rec.Code)
 	}
 	forged := &http.Cookie{Name: cookieName, Value: "99999999999.deadbeef"}
-	if rec := do(t, h, "GET", "/api/state", "", forged); rec.Code != http.StatusUnauthorized {
+	if rec := do(t, h, "GET", "/board", "", forged); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("forged cookie accepted: %d", rec.Code)
+	}
+	req := httptest.NewRequest("POST", "/timer/toggle", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	req.AddCookie(cookies[0])
+	cross := httptest.NewRecorder()
+	h.ServeHTTP(cross, req)
+	if cross.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin post: %d", cross.Code)
 	}
 }
 
@@ -198,47 +294,51 @@ func TestTokenExpiry(t *testing.T) {
 	}
 }
 
-func TestPlanAndPomodoroFlow(t *testing.T) {
-	h := newTestServer(t, "", fakePlanner{tasks: []PlannedTask{{Title: "Deck", Pomodoros: 3}, {Title: "Dentist"}}})
-	rec := do(t, h, "POST", "/api/plan", `{"text":"deck and dentist"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("plan: %d %s", rec.Code, rec.Body)
+func TestPlanBreakDeleteFlow(t *testing.T) {
+	srv, h := newTestServer(t, "", fakePlanner{tasks: []PlannedTask{{Title: "Deck", Pomodoros: 3}, {Title: "Dentist"}}})
+	rec := do(t, h, "POST", "/plan", "text=deck+and+dentist")
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "Deck") || !strings.Contains(body, "2 tasks added") || !strings.Contains(body, `hx-swap-oob="true"`) {
+		t.Fatalf("plan: %d %s", rec.Code, body)
 	}
-	st := decodeState(t, rec)
-	if len(st.Tasks) != 2 || st.Tasks[0].Source != SourceAI || st.Tasks[1].Source != SourceDefault || st.Tasks[1].Pomodoros != 1 {
-		t.Fatalf("tasks: %+v", st.Tasks)
+	st := srv.store.Snapshot()
+	if len(st.Items) != 2 || st.Items[0].Source != SourceAI || st.Items[1].Source != SourceDefault {
+		t.Fatalf("items: %+v", st.Items)
 	}
-	id := st.Tasks[0].ID
+	deck, dentist := st.Items[0].ID, st.Items[1].ID
 
-	body := `{"taskId":"` + id + `","day":"2026-10-31","endsAt":123}`
-	do(t, h, "POST", "/api/pomodoro", body)
-	st = decodeState(t, do(t, h, "POST", "/api/pomodoro", body)) // duplicate from a second tab
-	if st.Tasks[0].Completed != 1 || st.Stats["2026-10-31"] != 1 {
-		t.Fatalf("pomodoro credited wrong: %+v %v", st.Tasks[0], st.Stats)
+	do(t, h, "POST", "/items/"+deck+"/break-after", "")
+	st = srv.store.Snapshot()
+	if len(st.Items) != 3 || !st.Items[1].IsBreak() || st.Items[1].BreakMin != 5 {
+		t.Fatalf("break-after: %+v", st.Items)
+	}
+	brk := st.Items[1].ID
+	do(t, h, "POST", "/items/"+brk+"/minutes?delta=5", "")
+	do(t, h, "POST", "/order", "id="+dentist+"&id="+brk+"&id="+deck)
+	st = srv.store.Snapshot()
+	if st.Items[0].ID != dentist || st.Items[1].BreakMin != 10 {
+		t.Fatalf("order/minutes: %+v", st.Items)
 	}
 
-	st = decodeState(t, do(t, h, "PATCH", "/api/tasks/"+id, `{"pomodoros":5,"done":true}`))
-	if st.Tasks[0].Pomodoros != 5 || st.Tasks[0].Source != SourceManual || !st.Tasks[0].Done || st.Tasks[0].DoneAt == nil {
-		t.Fatalf("patch: %+v", st.Tasks[0])
+	do(t, h, "POST", "/items/"+deck+"/delete", "")
+	do(t, h, "POST", "/items/"+dentist+"/done", "")
+	st = srv.store.Snapshot()
+	if len(st.Items) != 2 || !st.Items[0].Done || st.item(deck) != nil {
+		t.Fatalf("delete/done: %+v", st.Items)
 	}
-	st = decodeState(t, do(t, h, "POST", "/api/clear-done", ""))
-	if len(st.Tasks) != 1 || st.Tasks[0].Title != "Dentist" {
-		t.Fatalf("clear done: %+v", st.Tasks)
+	do(t, h, "POST", "/clear-done", "")
+	if st = srv.store.Snapshot(); len(st.Items) != 1 || !st.Items[0].IsBreak() {
+		t.Fatalf("clear done: %+v", st.Items)
 	}
-	if rec := do(t, h, "PUT", "/api/timer", `{"phase":"nap"}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("bad phase accepted: %d", rec.Code)
+	if rec := do(t, h, "POST", "/items/nope/delete", ""); !strings.Contains(rec.Body.String(), "no longer exists") {
+		t.Fatalf("missing item should toast: %s", rec.Body)
 	}
 }
 
 func TestPlanFallsBackWhenAIFails(t *testing.T) {
-	h := newTestServer(t, "", fakePlanner{err: errors.New("not logged in")})
-	rec := do(t, h, "POST", "/api/plan", `{"text":"one\ntwo"}`)
-	var out struct {
-		State   State
-		Warning string
-	}
-	json.Unmarshal(rec.Body.Bytes(), &out)
-	if rec.Code != http.StatusOK || len(out.State.Tasks) != 2 || out.Warning == "" {
+	srv, h := newTestServer(t, "", fakePlanner{err: errors.New("not logged in")})
+	rec := do(t, h, "POST", "/plan", "text=one%0Atwo")
+	if !strings.Contains(rec.Body.String(), "AI planner failed") || len(srv.store.Snapshot().Items) != 2 {
 		t.Fatalf("fallback: %d %s", rec.Code, rec.Body)
 	}
 }

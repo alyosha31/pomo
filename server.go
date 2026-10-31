@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"html/template"
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,29 +19,62 @@ type Server struct {
 	planner Planner
 	auth    *Auth
 	web     fs.FS
+	tmpl    *template.Template
+	version string
+	now     func() time.Time
+}
+
+func NewServer(store *Store, planner Planner, auth *Auth, web fs.FS) (*Server, error) {
+	tmpl, err := parseTemplates(web)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		store: store, planner: planner, auth: auth, web: web, tmpl: tmpl,
+		version: strconv.FormatInt(time.Now().Unix(), 36),
+		now:     time.Now,
+	}, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/session", s.session)
-	mux.HandleFunc("POST /api/login", s.login)
-	mux.HandleFunc("POST /api/logout", s.logout)
+	static, _ := fs.Sub(s.web, "static")
+	mux.Handle("GET /static/", http.StripPrefix("/static/", cacheForever(http.FileServerFS(static))))
+	mux.HandleFunc("GET /login", s.loginPage)
+	mux.HandleFunc("POST /login", s.login)
+	mux.HandleFunc("POST /logout", s.logout)
 
-	api := http.NewServeMux()
-	api.HandleFunc("GET /api/state", s.getState)
-	api.HandleFunc("POST /api/plan", s.plan)
-	api.HandleFunc("POST /api/tasks", s.createTask)
-	api.HandleFunc("PATCH /api/tasks/{id}", s.patchTask)
-	api.HandleFunc("DELETE /api/tasks/{id}", s.deleteTask)
-	api.HandleFunc("PUT /api/order", s.putOrder)
-	api.HandleFunc("POST /api/clear-done", s.clearDone)
-	api.HandleFunc("PUT /api/timer", s.putTimer)
-	api.HandleFunc("POST /api/pomodoro", s.creditPomodoro)
-	api.HandleFunc("PUT /api/settings", s.putSettings)
-	mux.Handle("/api/", s.requireAuth(api))
+	app := http.NewServeMux()
+	app.HandleFunc("GET /{$}", s.index)
+	app.HandleFunc("GET /board", s.board)
+	app.HandleFunc("POST /timer/toggle", s.timerAction(func(st *State, now int64) error { return st.Toggle(now) }))
+	app.HandleFunc("POST /timer/skip", s.timerAction(func(st *State, now int64) error { st.Skip(now); return nil }))
+	app.HandleFunc("POST /timer/reset", s.timerAction(func(st *State, now int64) error { st.Reset(); return nil }))
+	app.HandleFunc("POST /timer/sync", s.timerAction(func(*State, int64) error { return nil }))
+	app.HandleFunc("POST /plan", s.plan)
+	app.HandleFunc("POST /items/new", s.newTask)
+	app.HandleFunc("GET /items/{id}/edit", s.editForm)
+	app.HandleFunc("POST /items/{id}", s.saveItem)
+	app.HandleFunc("POST /items/{id}/done", s.toggleDone)
+	app.HandleFunc("POST /items/{id}/delete", s.deleteItem)
+	app.HandleFunc("POST /items/{id}/pomodoros", s.stepPomodoros)
+	app.HandleFunc("POST /items/{id}/minutes", s.stepMinutes)
+	app.HandleFunc("POST /items/{id}/focus", s.focus)
+	app.HandleFunc("POST /items/{id}/break-after", s.breakAfter)
+	app.HandleFunc("POST /order", s.order)
+	app.HandleFunc("POST /clear-done", s.clearDone)
+	app.HandleFunc("POST /settings", s.saveSettings)
+	mux.Handle("/", s.requireAuth(app))
 
-	mux.Handle("/", http.FileServerFS(s.web))
-	return securityHeaders(mux)
+	return securityHeaders(sameOrigin(mux))
+}
+
+func cacheForever(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// asset URLs carry ?v=<server start>, so a deploy busts the cache
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -47,9 +83,24 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "same-origin")
 		h.Set("X-Frame-Options", "DENY")
-		h.Set("Permissions-Policy", "microphone=(self)")
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		if !strings.HasPrefix(r.URL.Path, "/static/") {
 			h.Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameOrigin rejects cross-site form posts. The session cookie is SameSite
+// Lax already; this covers older browsers.
+func sameOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if o := r.Header.Get("Origin"); o != "" {
+				if u, err := url.Parse(o); err != nil || u.Host != r.Host {
+					http.Error(w, "cross-origin request refused", http.StatusForbidden)
+					return
+				}
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -58,332 +109,342 @@ func securityHeaders(next http.Handler) http.Handler {
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.auth.Authed(r) {
-			writeError(w, http.StatusUnauthorized, "log in first")
+			if r.Header.Get("HX-Request") != "" {
+				w.Header().Set("HX-Redirect", "/login")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}
-
-func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		writeError(w, http.StatusBadRequest, "bad request body: "+err.Error())
-		return false
-	}
-	return true
-}
-
-// update runs fn against the store and replies with the new state.
-func (s *Server) update(w http.ResponseWriter, fn func(*State) error) {
-	st, err := s.store.Update(fn)
-	if err != nil {
-		var he httpError
-		if errors.As(err, &he) {
-			writeError(w, he.status, he.msg)
-			return
-		}
-		log.Printf("update: %v", err)
-		writeError(w, http.StatusInternalServerError, "could not save")
+func (s *Server) render(w http.ResponseWriter, name string, data any) {
+	var buf bytes.Buffer
+	if err := s.tmpl.ExecuteTemplate(&buf, name, data); err != nil {
+		log.Printf("render %s: %v", name, err)
+		http.Error(w, "render error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"state": st})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(buf.Bytes())
 }
 
-type httpError struct {
-	status int
-	msg    string
-}
+type httpError struct{ msg string }
 
 func (e httpError) Error() string { return e.msg }
 
-func badRequest(msg string) error { return httpError{http.StatusBadRequest, msg} }
+var errNoItem = httpError{"that item no longer exists"}
 
-var errNoTask = httpError{http.StatusNotFound, "task not found"}
-
-func (s *Server) session(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authed":       s.auth.Authed(r),
-		"authRequired": s.auth.Enabled(),
-		"planner":      s.planner.Name(),
+// mutate applies fn (after catching the timer up) and answers with the
+// board as out-of-band swaps. A user-facing error comes back as a toast.
+func (s *Server) mutate(w http.ResponseWriter, fn func(st *State, now int64) error, o viewOpts) {
+	now := s.now()
+	st, err := s.store.Update(func(st *State) error {
+		st.Advance(now.UnixMilli())
+		return fn(st, now.UnixMilli())
 	})
+	if err != nil {
+		var he httpError
+		msg := err.Error()
+		if !errors.As(err, &he) && err != errQueueEmpty {
+			log.Printf("update: %v", err)
+			msg = "could not save"
+		}
+		st = s.store.Snapshot()
+		o.toasts = append(o.toasts, toast{"err", msg})
+	}
+	v := s.newView(st, now, o)
+	v.OOB = true
+	s.render(w, "board", v)
+}
+
+// current returns the state with the timer caught up, saving only when a
+// phase actually ended.
+func (s *Server) current() State {
+	st := s.store.Snapshot()
+	now := s.now().UnixMilli()
+	if st.Timer.Running() && now >= st.Timer.EndsAt {
+		if next, err := s.store.Update(func(st *State) error { st.Advance(now); return nil }); err == nil {
+			return next
+		}
+	}
+	return st
+}
+
+func (s *Server) index(w http.ResponseWriter, r *http.Request) {
+	s.render(w, "page", s.newView(s.current(), s.now(), viewOpts{}))
+}
+
+func (s *Server) board(w http.ResponseWriter, r *http.Request) {
+	v := s.newView(s.current(), s.now(), viewOpts{})
+	v.OOB = true
+	s.render(w, "board", v)
+}
+
+func (s *Server) timerAction(fn func(*State, int64) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { s.mutate(w, fn, viewOpts{}) }
+}
+
+/* ---------- auth ---------- */
+
+func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
+	if s.auth.Authed(r) {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	s.render(w, "login", map[string]string{"Version": s.version})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Password string `json:"password"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
 	if !s.auth.Enabled() {
-		writeJSON(w, http.StatusOK, map[string]bool{"authed": true})
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if !s.auth.CheckPassword(body.Password) {
+	if !s.auth.CheckPassword(r.FormValue("password")) {
 		time.Sleep(time.Second) // blunt brute-force damper
-		writeError(w, http.StatusUnauthorized, "wrong password")
+		w.WriteHeader(http.StatusUnauthorized)
+		s.render(w, "login", map[string]string{"Version": s.version, "Error": "Wrong password"})
 		return
 	}
 	s.auth.SetSession(w, r)
-	writeJSON(w, http.StatusOK, map[string]bool{"authed": true})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	s.auth.ClearSession(w)
-	writeJSON(w, http.StatusOK, map[string]bool{"authed": false})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"state": s.store.Snapshot()})
-}
+/* ---------- planning ---------- */
 
 func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Text string `json:"text"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	text := strings.TrimSpace(body.Text)
+	text := strings.TrimSpace(r.FormValue("text"))
 	if text == "" {
-		writeError(w, http.StatusBadRequest, "say or type what's on your plate first")
+		s.mutate(w, func(*State, int64) error { return httpError{"type what's on your plate first"} }, viewOpts{})
 		return
 	}
 	if len(text) > 20000 {
-		writeError(w, http.StatusBadRequest, "that's a lot — keep it under 20,000 characters")
+		s.mutate(w, func(*State, int64) error { return httpError{"keep it under 20,000 characters"} }, viewOpts{})
 		return
 	}
 
 	snap := s.store.Snapshot()
 	req := PlanRequest{Text: text, WorkMin: snap.Settings.WorkMin}
-	for _, t := range snap.Tasks {
-		if !t.Done {
-			req.Existing = append(req.Existing, t.Title)
+	for _, it := range snap.Open() {
+		if !it.IsBreak() {
+			req.Existing = append(req.Existing, it.Title)
 		}
 	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 	defer cancel()
-	planner, warning := s.planner.Name(), ""
+	planner := s.planner.Name()
 	planned, err := s.planner.Plan(ctx, req)
+	var toasts []toast
 	if err != nil {
 		log.Printf("planner %s failed: %v", planner, err)
-		warning = "AI planner failed, so the text was split line by line. (" + truncate(err.Error(), 160) + ")"
+		toasts = append(toasts, toast{"warn", "AI planner failed, so the text was split line by line. (" + truncate(err.Error(), 160) + ")"})
 		planner = "none"
 		planned, _ = SimplePlanner{}.Plan(ctx, req)
 	}
-	if len(planned) == 0 {
-		writeError(w, http.StatusUnprocessableEntity, "couldn't find any tasks in that")
-		return
-	}
 
-	var added []string
-	st, err := s.store.Update(func(st *State) error {
-		now := time.Now().UTC()
+	fresh := map[string]bool{}
+	s.mutate(w, func(st *State, now int64) error {
+		if len(planned) == 0 {
+			return httpError{"couldn't find any tasks in that"}
+		}
+		created := time.UnixMilli(now).UTC()
 		for _, p := range planned {
-			t := Task{ID: newID(), Title: p.Title, Notes: p.Notes, Pomodoros: p.Pomodoros, Source: SourceAI, CreatedAt: now}
-			if planner == "none" || t.Pomodoros == 0 {
-				t.Pomodoros, t.Source = 1, SourceDefault
+			it := Item{ID: newID(), Kind: KindTask, Title: p.Title, Notes: p.Notes, Pomodoros: p.Pomodoros, Source: SourceAI, CreatedAt: created}
+			if planner == "none" || it.Pomodoros == 0 {
+				it.Pomodoros, it.Source = 1, SourceDefault
 			}
-			st.Tasks = append(st.Tasks, t)
-			added = append(added, t.ID)
+			st.Items = append(st.Items, it)
+			fresh[it.ID] = true
 		}
 		return nil
-	})
-	if err != nil {
-		log.Printf("plan save: %v", err)
-		writeError(w, http.StatusInternalServerError, "could not save")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"state": st, "added": added, "planner": planner, "warning": warning})
+	}, viewOpts{fresh: fresh, toasts: append(toasts, toast{"", plural(len(planned), "task") + " added"})})
 }
 
-func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Title     string `json:"title"`
-		Notes     string `json:"notes"`
-		Pomodoros int    `json:"pomodoros"`
-		Completed int    `json:"completed"`
-		Source    string `json:"source"`
-		Index     *int   `json:"index"`
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
 	}
-	if !readJSON(w, r, &body) {
+	return strconv.Itoa(n) + " " + word + "s"
+}
+
+/* ---------- items ---------- */
+
+func (s *Server) newTask(w http.ResponseWriter, r *http.Request) {
+	id := newID()
+	s.mutate(w, func(st *State, now int64) error {
+		st.Items = append(st.Items, Item{ID: id, Kind: KindTask, Title: "New task", Pomodoros: 1, Source: SourceManual, CreatedAt: time.UnixMilli(now).UTC()})
+		return nil
+	}, viewOpts{editing: id, fresh: map[string]bool{id: true}})
+}
+
+func (s *Server) editForm(w http.ResponseWriter, r *http.Request) {
+	st := s.store.Snapshot()
+	it := st.item(r.PathValue("id"))
+	if it == nil || it.IsBreak() {
+		s.board(w, r)
 		return
 	}
-	s.update(w, func(st *State) error {
-		title := truncate(strings.TrimSpace(body.Title), 140)
+	iv := s.itemView(&st, *it, viewOpts{editing: it.ID})
+	s.render(w, "item", iv)
+}
+
+func (s *Server) saveItem(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	title := truncate(strings.TrimSpace(r.FormValue("title")), 140)
+	notes := truncate(strings.TrimSpace(r.FormValue("notes")), 500)
+	s.mutate(w, func(st *State, now int64) error {
+		it := st.item(id)
+		if it == nil {
+			return errNoItem
+		}
 		if title == "" {
-			return badRequest("title is required")
+			return httpError{"title can't be empty"}
 		}
-		t := Task{
-			ID:        newID(),
-			Title:     title,
-			Notes:     truncate(strings.TrimSpace(body.Notes), 500),
-			Pomodoros: max(1, min(body.Pomodoros, 50)),
-			Completed: max(0, body.Completed),
-			Source:    SourceManual,
-			CreatedAt: time.Now().UTC(),
-		}
-		if body.Source == SourceAI || body.Source == SourceDefault {
-			t.Source = body.Source
-		}
-		i := len(st.Tasks)
-		if body.Index != nil && *body.Index >= 0 && *body.Index < i {
-			i = *body.Index
-		}
-		st.Tasks = append(st.Tasks[:i], append([]Task{t}, st.Tasks[i:]...)...)
+		it.Title, it.Notes = title, notes
 		return nil
-	})
+	}, viewOpts{})
 }
 
-func (s *Server) patchTask(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Title     *string `json:"title"`
-		Notes     *string `json:"notes"`
-		Pomodoros *int    `json:"pomodoros"`
-		Completed *int    `json:"completed"`
-		Done      *bool   `json:"done"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
+func (s *Server) toggleDone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.update(w, func(st *State) error {
-		t := st.task(id)
-		if t == nil {
-			return errNoTask
+	s.mutate(w, func(st *State, now int64) error {
+		it := st.item(id)
+		if it == nil {
+			return errNoItem
 		}
-		if body.Title != nil {
-			title := truncate(strings.TrimSpace(*body.Title), 140)
-			if title == "" {
-				return badRequest("title can't be empty")
+		st.leaving(id, now, func() {
+			switch {
+			case it.IsBreak():
+				st.remove(id)
+			case it.Done:
+				it.Done, it.DoneAt = false, nil
+			default:
+				markDone(it, now)
 			}
-			t.Title = title
-		}
-		if body.Notes != nil {
-			t.Notes = truncate(strings.TrimSpace(*body.Notes), 500)
-		}
-		if body.Pomodoros != nil {
-			t.Pomodoros = max(1, min(*body.Pomodoros, 50))
-			t.Source = SourceManual
-		}
-		if body.Completed != nil {
-			t.Completed = max(0, min(*body.Completed, 99))
-		}
-		if body.Done != nil && *body.Done != t.Done {
-			t.Done = *body.Done
-			t.DoneAt = nil
-			if t.Done {
-				now := time.Now().UTC()
-				t.DoneAt = &now
-			}
-		}
+		})
 		return nil
-	})
+	}, viewOpts{})
 }
 
-func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
+func (s *Server) deleteItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.update(w, func(st *State) error {
-		for i, t := range st.Tasks {
-			if t.ID == id {
-				st.Tasks = append(st.Tasks[:i], st.Tasks[i+1:]...)
-				return nil
-			}
+	s.mutate(w, func(st *State, now int64) error {
+		if st.item(id) == nil {
+			return errNoItem
 		}
-		return errNoTask
-	})
+		st.leaving(id, now, func() { st.remove(id) })
+		return nil
+	}, viewOpts{})
 }
 
-func (s *Server) putOrder(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		IDs []string `json:"ids"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	s.update(w, func(st *State) error {
-		st.Reorder(body.IDs)
+func delta(r *http.Request) int {
+	d, _ := strconv.Atoi(r.URL.Query().Get("delta"))
+	return d
+}
+
+func (s *Server) stepPomodoros(w http.ResponseWriter, r *http.Request) {
+	id, d := r.PathValue("id"), delta(r)
+	s.mutate(w, func(st *State, now int64) error {
+		it := st.item(id)
+		if it == nil || it.IsBreak() {
+			return errNoItem
+		}
+		it.Pomodoros = max(1, min(it.Pomodoros+d, 50))
+		it.Source = SourceManual
 		return nil
-	})
+	}, viewOpts{})
+}
+
+func (s *Server) stepMinutes(w http.ResponseWriter, r *http.Request) {
+	id, d := r.PathValue("id"), delta(r)
+	s.mutate(w, func(st *State, now int64) error {
+		it := st.item(id)
+		if it == nil || !it.IsBreak() {
+			return errNoItem
+		}
+		it.BreakMin = max(1, min(it.BreakMin+d, 120))
+		// a break that hasn't started yet picks up the new length
+		if t := st.Timer; t.ItemID == id && !t.Running() && t.Remaining == t.Duration {
+			st.load(it, false, now)
+		}
+		return nil
+	}, viewOpts{})
+}
+
+func (s *Server) focus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s.mutate(w, func(st *State, now int64) error { return st.FocusNow(id, now) }, viewOpts{})
+}
+
+func (s *Server) breakAfter(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	brk := Item{ID: newID(), Kind: KindBreak, Title: "Break", CreatedAt: s.now().UTC()}
+	s.mutate(w, func(st *State, now int64) error {
+		i := st.index(id)
+		if i < 0 {
+			return errNoItem
+		}
+		brk.BreakMin = st.Settings.BreakMin
+		st.insert(i+1, brk)
+		return nil
+	}, viewOpts{fresh: map[string]bool{brk.ID: true}})
+}
+
+func (s *Server) order(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	ids := r.Form["id"]
+	s.mutate(w, func(st *State, now int64) error {
+		st.Reorder(ids)
+		// an idle timer always shows the new head; a loaded but unstarted
+		// item follows the queue too
+		if t := st.Timer; t.Phase == PhaseWork || t.Phase == PhaseBreak {
+			if !t.Running() && t.Remaining == t.Duration {
+				st.next(now, false)
+			}
+		}
+		return nil
+	}, viewOpts{})
 }
 
 func (s *Server) clearDone(w http.ResponseWriter, r *http.Request) {
-	s.update(w, func(st *State) error {
-		open := st.Tasks[:0]
-		for _, t := range st.Tasks {
-			if !t.Done {
-				open = append(open, t)
-			}
+	s.mutate(w, func(st *State, now int64) error {
+		st.Items = st.Open()
+		if st.Items == nil {
+			st.Items = []Item{}
 		}
-		st.Tasks = open
 		return nil
-	})
+	}, viewOpts{})
 }
 
-func (s *Server) putTimer(w http.ResponseWriter, r *http.Request) {
-	var t Timer
-	if !readJSON(w, r, &t) {
-		return
+func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
+	num := func(k string) int { n, _ := strconv.Atoi(r.FormValue(k)); return n }
+	set := Settings{
+		WorkMin:    num("workMin"),
+		ShortMin:   num("shortMin"),
+		BreakMin:   num("breakMin"),
+		AutoBreaks: r.FormValue("autoBreaks") != "",
+		AutoWork:   r.FormValue("autoWork") != "",
+		Sound:      r.FormValue("sound") != "",
 	}
-	s.update(w, func(st *State) error {
-		if err := t.Validate(); err != nil {
-			return badRequest(err.Error())
-		}
-		st.Timer = t
-		return nil
-	})
-}
-
-// creditPomodoro records a finished focus session. EndsAt identifies the
-// session, so two open tabs finishing the same one only count it once.
-func (s *Server) creditPomodoro(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		TaskID string `json:"taskId"`
-		Day    string `json:"day"`
-		EndsAt int64  `json:"endsAt"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	if _, err := time.Parse(time.DateOnly, body.Day); err != nil {
-		writeError(w, http.StatusBadRequest, "day must be YYYY-MM-DD")
-		return
-	}
-	s.update(w, func(st *State) error {
-		if body.EndsAt != 0 && body.EndsAt == st.LastCredit {
-			return nil
-		}
-		if t := st.task(body.TaskID); t != nil {
-			t.Completed++
-		}
-		st.Stats[body.Day]++
-		st.LastCredit = body.EndsAt
-		return nil
-	})
-}
-
-func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
-	var set Settings
-	if !readJSON(w, r, &set) {
-		return
-	}
-	s.update(w, func(st *State) error {
+	s.mutate(w, func(st *State, now int64) error {
 		if err := set.Validate(); err != nil {
-			return badRequest(err.Error())
+			return httpError{err.Error()}
 		}
 		st.Settings = set
+		// a loaded phase that hasn't started picks up the new length
+		if t := st.Timer; t.Phase != PhaseIdle && !t.Running() && t.Remaining == t.Duration {
+			if it := st.TimerItem(); it != nil {
+				st.setPhase(t.Phase, it, false, now)
+			}
+		}
 		return nil
-	})
+	}, viewOpts{toasts: []toast{{"", "Settings saved"}}})
 }

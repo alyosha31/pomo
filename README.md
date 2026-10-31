@@ -2,12 +2,11 @@
 
 A self-hosted Pomodoro planner. Talk or type everything on your plate, and pomo turns it into tasks with pomodoro estimates, then runs focus and break sessions through them.
 
-- **Brain dump → tasks.** Dictate with the mic (Web Speech API) or type. The text goes to the Claude Code CLI (or Codex) on the server, which splits it into tasks, orders them by any priorities you mentioned, and estimates pomodoros where it can tell. Tasks it can't size get a 1-pomodoro placeholder marked *set estimate*.
+- **Brain dump → tasks.** Type everything on your plate (or dictate with a local tool like Handy). The text goes to the Claude Code CLI (or Codex) on the server, which splits it into tasks, orders them by any priorities you mentioned, and estimates pomodoros where it can tell. Tasks it can't size get a 1-pomodoro placeholder marked *set estimate*.
 - **No API key.** It shells out to `claude -p` (or `codex exec`) on the server, so it runs on that machine's existing subscription login.
-- **Drag to reorder.** Works with mouse and touch. The timer always takes the top open task next.
-- **Timer.** 25 min of focus, then a 5 min short break between pomodoros of the same task and a 15 min long break between tasks (all adjustable). When a task's last planned pomodoro finishes, it asks: *Mark done* or *+1 pomodoro*.
-- **Stays in sync.** State lives on the server, so a refresh or a second device picks up the running timer. Chime and browser notification at the end of each phase.
-- One Go binary with the frontend embedded. State is a single JSON file.
+- **A queue of tasks and breaks.** Drag to reorder (mouse or touch). Add a break between tasks with **+ break**; it starts at 5 minutes, adjustable per break. The timer works through the queue top to bottom.
+- **Timer.** 25 min of focus per pomodoro, with an automatic 5 min short break between pomodoros of the same task (both adjustable). The clock is green before it starts, yellow while running, red for the last minute.
+- **Server-rendered.** Go `html/template` + htmx; the server owns the timer state, so a refresh or a second device picks up where you left off. One binary with templates and assets embedded; state is a single JSON file.
 
 Keys: <kbd>Space</kbd> start/pause, <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> plan the dump or save an edit, <kbd>Esc</kbd> cancel an edit.
 
@@ -35,6 +34,6 @@ mkdir -p ~/.config/pomo && printf 'POMO_PASSWORD=%s\n' "$(openssl rand -base64 1
 sudo cp deploy/pomo.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now pomo
 ```
 
-Then put it behind HTTPS (needed for the mic and notifications). With Caddy, use [`deploy/Caddyfile`](deploy/Caddyfile) with your domain, and point a DNS A record at the server.
+Then put it behind HTTPS (needed for notifications, and for the password to travel safely). With Caddy, use [`deploy/Caddyfile`](deploy/Caddyfile) with your domain, and point a DNS A record at the server.
 
 The service runs as your user so it can reach `~/.claude` (or `~/.codex`). Check `claude -p hello` works as that user first.
