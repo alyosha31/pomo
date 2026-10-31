@@ -135,18 +135,14 @@ func TestTimerWalksTheQueue(t *testing.T) {
 	if st.Timer.Phase != PhaseWork || st.Timer.ItemID != "a" || st.Timer.EndsAt != 25*minute {
 		t.Fatalf("start: %+v", st.Timer)
 	}
-	// first pomodoro of A ends: short break starts on its own
+	// first pomodoro of A ends: no automatic break, the next pomodoro of A
+	// waits for Start (autoWork off)
 	st.Advance(25 * minute)
-	if st.Timer.Phase != PhaseShort || !st.Timer.Running() || st.Items[0].Completed != 1 {
+	if st.Timer.Phase != PhaseWork || st.Timer.ItemID != "a" || st.Timer.Running() || st.Items[0].Completed != 1 {
 		t.Fatalf("after pomodoro 1: %+v", st.Timer)
 	}
-	// short break ends: next pomodoro waits for Start (autoWork off)
-	st.Advance(30 * minute)
-	if st.Timer.Phase != PhaseWork || st.Timer.Running() {
-		t.Fatalf("after short break: %+v", st.Timer)
-	}
 	st.Toggle(31 * minute)
-	// A's last pomodoro ends: A done, the break item starts on its own
+	// A's last pomodoro ends: A done, the queued break starts on its own
 	st.Advance(56 * minute)
 	if !st.Items[0].Done || st.Timer.Phase != PhaseBreak || st.Timer.ItemID != "b1" || st.Timer.Duration != 10*minute || !st.Timer.Running() {
 		t.Fatalf("after A: %+v items %+v", st.Timer, st.Items)
@@ -165,7 +161,7 @@ func TestAdvanceCatchesUpSeveralPhases(t *testing.T) {
 	st := queueState()
 	st.Settings.AutoWork = true
 	st.Toggle(0)
-	// everything runs on its own: A(25) short(5) A(25) break(10) C(25)
+	// everything runs on its own: A(25) A(25) break(10) C(25)
 	st.Advance(200 * minute)
 	if st.Timer.Phase != PhaseIdle || len(st.Open()) != 0 {
 		t.Fatalf("expected the whole queue done: %+v %+v", st.Timer, st.Items)
@@ -179,8 +175,8 @@ func TestSkipPauseAndLeaving(t *testing.T) {
 	if st.Timer.Running() || st.Timer.Remaining != 15*minute {
 		t.Fatalf("pause: %+v", st.Timer)
 	}
-	st.Skip(11 * minute) // skipped pomodoro doesn't count
-	if st.Items[0].Completed != 0 || st.Timer.Phase != PhaseShort {
+	st.Skip(11 * minute) // finishing early counts the pomodoro
+	if st.Items[0].Completed != 1 || st.Timer.Phase != PhaseWork || st.Timer.Running() {
 		t.Fatalf("skip: %+v %+v", st.Timer, st.Items[0])
 	}
 	// deleting the item the timer is on moves to the next one, unstarted
@@ -196,8 +192,8 @@ func TestSkipPauseAndLeaving(t *testing.T) {
 func TestQueueSummary(t *testing.T) {
 	st := queueState()
 	sm := queueSummary(st, st.Open(), 0)
-	// A: 2×25 + 5, break 10, C: 25
-	if sm.Tasks != 2 || sm.Pomos != 3 || sm.Minutes != 90 {
+	// A: 2×25, break 10, C: 25
+	if sm.Tasks != 2 || sm.Pomos != 3 || sm.Minutes != 85 {
 		t.Errorf("got %+v", sm)
 	}
 }

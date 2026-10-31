@@ -123,7 +123,6 @@ func (s *Server) itemView(st *State, it Item, o viewOpts) itemView {
 var phaseLabels = map[string]string{
 	PhaseIdle:  "Ready",
 	PhaseWork:  "Focus",
-	PhaseShort: "Short break",
 	PhaseBreak: "Break",
 }
 
@@ -156,9 +155,6 @@ func newTimerView(st *State, now int64) timerView {
 			tv.Title = it.Title
 			n := it.Completed + 1
 			tv.Sub = fmt.Sprintf("pomodoro %d of %d", n, max(it.Pomodoros, n))
-		case PhaseShort:
-			tv.Title = "Then: " + it.Title
-			tv.Sub = fmt.Sprintf("%d of %d done", it.Completed, it.Pomodoros)
 		case PhaseBreak:
 			tv.Title = "Step away from the screen"
 		}
@@ -179,12 +175,11 @@ func newTimerView(st *State, now int64) timerView {
 	return tv
 }
 
-// queueSummary is the time left in the queue, counting short breaks between
-// a task's pomodoros and the break items.
+// queueSummary is the time left in the queue: pomodoros plus break items.
 func queueSummary(st *State, open []Item, now int64) summary {
 	var sm summary
 	var ms int64
-	work, short := int64(st.Settings.WorkMin)*60_000, int64(st.Settings.ShortMin)*60_000
+	work := int64(st.Settings.WorkMin) * 60_000
 	for _, it := range open {
 		if it.IsBreak() {
 			ms += int64(it.BreakMin) * 60_000
@@ -193,7 +188,7 @@ func queueSummary(st *State, open []Item, now int64) summary {
 		left := max(it.Pomodoros-it.Completed, 1)
 		sm.Tasks++
 		sm.Pomos += left
-		ms += int64(left)*work + int64(left-1)*short
+		ms += int64(left) * work
 	}
 	// account for the phase in progress
 	t := st.Timer
@@ -204,8 +199,6 @@ func queueSummary(st *State, open []Item, now int64) summary {
 	switch t.Phase {
 	case PhaseWork, PhaseBreak:
 		ms -= t.Duration - rem
-	case PhaseShort:
-		ms += rem
 	}
 	sm.Minutes = int(max(ms, 0) / 60_000)
 	return sm

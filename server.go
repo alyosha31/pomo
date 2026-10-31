@@ -428,7 +428,6 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	num := func(k string) int { n, _ := strconv.Atoi(r.FormValue(k)); return n }
 	set := Settings{
 		WorkMin:    num("workMin"),
-		ShortMin:   num("shortMin"),
 		BreakMin:   num("breakMin"),
 		AutoBreaks: r.FormValue("autoBreaks") != "",
 		AutoWork:   r.FormValue("autoWork") != "",

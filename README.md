@@ -5,7 +5,7 @@ A self-hosted Pomodoro planner. Talk or type everything on your plate, and pomo 
 - **Brain dump → tasks.** Type everything on your plate (or dictate with a local tool like Handy). The text goes to the Claude Code CLI (or Codex) on the server, which splits it into tasks, orders them by any priorities you mentioned, and estimates pomodoros where it can tell. Tasks it can't size get a 1-pomodoro placeholder marked *set estimate*.
 - **No API key.** It shells out to `claude -p` (or `codex exec`) on the server, so it runs on that machine's existing subscription login.
 - **A queue of tasks and breaks.** Drag to reorder (mouse or touch). Add a break between tasks with **+ break**; it starts at 5 minutes, adjustable per break. The timer works through the queue top to bottom.
-- **Timer.** 25 min of focus per pomodoro, with an automatic 5 min short break between pomodoros of the same task (both adjustable). The clock is green before it starts, yellow while running, red for the last minute.
+- **Timer.** 25 min of focus per pomodoro (adjustable). A task's pomodoros run back to back; the only breaks are the ones you put in the queue. The clock is green before it starts, yellow while running, red for the last minute.
 - **Server-rendered.** Go `html/template` + htmx; the server owns the timer state, so a refresh or a second device picks up where you left off. One binary with templates and assets embedded; state is a single JSON file.
 
 Keys: <kbd>Space</kbd> start/pause, <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> plan the dump or save an edit, <kbd>Esc</kbd> cancel an edit.

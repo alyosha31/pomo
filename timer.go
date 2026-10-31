@@ -5,17 +5,14 @@ import (
 	"time"
 )
 
-// The timer walks the queue top to bottom. A task runs its pomodoros with
-// short breaks between them, then is marked done; a break item runs once and
-// is removed. Times are unix milliseconds so the browser can count down to
-// the same instant.
+// The timer walks the queue top to bottom. A task runs its pomodoros back
+// to back, then is marked done; a break item runs once and is removed. The
+// only breaks are the ones the user puts in the queue. Times are unix
+// milliseconds so the browser can count down to the same instant.
 
 func (st *State) phaseMs(phase string, it *Item) int64 {
 	min := st.Settings.WorkMin
-	switch phase {
-	case PhaseShort:
-		min = st.Settings.ShortMin
-	case PhaseBreak:
+	if phase == PhaseBreak {
 		min = it.BreakMin
 	}
 	return int64(max(min, 1)) * 60_000
@@ -80,9 +77,9 @@ func (st *State) Toggle(now int64) error {
 	return nil
 }
 
-// finish ends the current phase at time at and moves on. credit is false
-// for a skip, which does not count the pomodoro.
-func (st *State) finish(at int64, credit bool) {
+// finish ends the current phase at time at, counts a finished pomodoro,
+// and moves on.
+func (st *State) finish(at int64) {
 	it := st.TimerItem()
 	if it == nil {
 		st.next(at, false)
@@ -90,18 +87,13 @@ func (st *State) finish(at int64, credit bool) {
 	}
 	switch st.Timer.Phase {
 	case PhaseWork:
-		if credit {
-			it.Completed++
-			st.Stats[time.UnixMilli(at).Format(time.DateOnly)]++
-		}
+		it.Completed++
+		st.Stats[time.UnixMilli(at).Format(time.DateOnly)]++
 		if it.Completed < it.Pomodoros {
-			st.setPhase(PhaseShort, it, st.Settings.AutoBreaks, at)
+			st.setPhase(PhaseWork, it, st.Settings.AutoWork, at)
 			return
 		}
 		markDone(it, at)
-	case PhaseShort:
-		st.setPhase(PhaseWork, it, st.Settings.AutoWork, at)
-		return
 	case PhaseBreak:
 		st.remove(it.ID)
 	}
@@ -113,15 +105,17 @@ func (st *State) finish(at int64, credit bool) {
 func (st *State) Advance(now int64) bool {
 	changed := false
 	for st.Timer.Running() && now >= st.Timer.EndsAt {
-		st.finish(st.Timer.EndsAt, true)
+		st.finish(st.Timer.EndsAt)
 		changed = true
 	}
 	return changed
 }
 
+// Skip ends the current phase early: a pomodoro finished early still
+// counts; a break is just over.
 func (st *State) Skip(now int64) {
 	if st.Timer.Phase != PhaseIdle {
-		st.finish(now, false)
+		st.finish(now)
 	}
 }
 

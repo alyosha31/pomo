@@ -92,7 +92,11 @@
   <div class="controls">
     <button type="button" class="btn ghost" hx-post="/timer/reset" {{if eq $t.Phase "idle"}}disabled{{end}} title="Stop and reset">Reset</button>
     <button type="button" class="btn primary big" id="toggle" hx-post="/timer/toggle">{{$t.Toggle}}</button>
-    <button type="button" class="btn ghost" hx-post="/timer/skip" {{if eq $t.Phase "idle"}}disabled{{end}} title="Skip to what's next">Skip</button>
+    {{if eq $t.Phase "work"}}
+    <button type="button" class="btn ghost" hx-post="/timer/skip" title="Done early: end this pomodoro now and count it">Finish</button>
+    {{else}}
+    <button type="button" class="btn ghost" hx-post="/timer/skip" {{if eq $t.Phase "idle"}}disabled{{end}} title="End the break now">Skip</button>
+    {{end}}
   </div>
 </div>
 {{end}}
@@ -206,10 +210,9 @@
   <h3>Settings</h3>
   <div class="grid3">
     <label>Focus<input type="number" name="workMin" min="1" max="180" value="{{.Settings.WorkMin}}" required><span>min</span></label>
-    <label>Short break<input type="number" name="shortMin" min="1" max="60" value="{{.Settings.ShortMin}}" required><span>min</span></label>
-    <label>Queue break<input type="number" name="breakMin" min="1" max="120" value="{{.Settings.BreakMin}}" required><span>min</span></label>
+    <label>New break<input type="number" name="breakMin" min="1" max="120" value="{{.Settings.BreakMin}}" required><span>min</span></label>
   </div>
-  <p class="muted small-text">Short breaks run automatically between pomodoros of the same task. Queue breaks are the ones you add with <b>+ break</b>; this is their starting length.</p>
+  <p class="muted small-text">There are no automatic breaks. Add one wherever you want it with <b>+ break</b>; new breaks start at this length.</p>
   <label class="switch"><input type="checkbox" name="autoBreaks" value="1" {{if .Settings.AutoBreaks}}checked{{end}}> Start breaks automatically</label>
   <label class="switch"><input type="checkbox" name="autoWork" value="1" {{if .Settings.AutoWork}}checked{{end}}> Start the next pomodoro automatically</label>
   <label class="switch"><input type="checkbox" name="sound" value="1" {{if .Settings.Sound}}checked{{end}}> Chime when a phase ends</label>

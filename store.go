@@ -46,7 +46,6 @@ func (it Item) IsBreak() bool { return it.Kind == KindBreak }
 const (
 	PhaseIdle  = "idle"
 	PhaseWork  = "work"  // a pomodoro of a task
-	PhaseShort = "short" // automatic break between pomodoros of one task
 	PhaseBreak = "break" // a break item from the queue
 )
 
@@ -62,7 +61,6 @@ func (t Timer) Running() bool { return t.Phase != PhaseIdle && t.EndsAt > 0 }
 
 type Settings struct {
 	WorkMin    int  `json:"workMin"`
-	ShortMin   int  `json:"shortMin"` // between pomodoros of the same task
 	BreakMin   int  `json:"breakMin"` // default length of a break added to the queue
 	AutoBreaks bool `json:"autoBreaks"`
 	AutoWork   bool `json:"autoWork"`
@@ -80,7 +78,7 @@ func defaultState() State {
 	return State{
 		Items:    []Item{},
 		Timer:    Timer{Phase: PhaseIdle},
-		Settings: Settings{WorkMin: 25, ShortMin: 5, BreakMin: 5, AutoBreaks: true, Sound: true},
+		Settings: Settings{WorkMin: 25, BreakMin: 5, AutoBreaks: true, Sound: true},
 		Stats:    map[string]int{},
 	}
 }
@@ -89,8 +87,6 @@ func (s Settings) Validate() error {
 	switch {
 	case s.WorkMin < 1 || s.WorkMin > 180:
 		return errors.New("focus length must be 1-180 minutes")
-	case s.ShortMin < 1 || s.ShortMin > 60:
-		return errors.New("short break must be 1-60 minutes")
 	case s.BreakMin < 1 || s.BreakMin > 120:
 		return errors.New("default break must be 1-120 minutes")
 	}
@@ -207,7 +203,7 @@ func OpenStore(path string) (*Store, error) {
 		st.Settings = defaultState().Settings
 	}
 	switch st.Timer.Phase {
-	case PhaseWork, PhaseShort, PhaseBreak:
+	case PhaseWork, PhaseBreak:
 		if st.item(st.Timer.ItemID) == nil {
 			st.Timer = Timer{Phase: PhaseIdle}
 		}
