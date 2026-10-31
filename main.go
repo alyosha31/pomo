@@ -1,168 +1,83 @@
+// Command pomo is a self-hosted Pomodoro planner: dump your tasks by voice
+// or text, let Claude (or Codex) turn them into estimated tasks, then work
+// through them with a focus/break timer.
 package main
 
 import (
-	"errors"
-	"fmt"
+	"embed"
+	"flag"
+	"io/fs"
+	"log"
+	"net"
+	"net/http"
 	"os"
-	"strconv"
+	"path/filepath"
 	"time"
 )
 
-const usage = `pomo - a tiny terminal Pomodoro timer
+//go:embed web
+var webFiles embed.FS
 
-Usage:
-  pomo [MINUTES]       Run a live foreground timer (default: 40)
-  pomo start [MINUTES] Start a timer and return immediately
-  pomo status [--short]
-  pomo toggle          Pause or resume
-  pomo stop            Stop the timer
-  pomo help
-`
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func defaultDataPath() string {
+	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
+		return filepath.Join(dir, "pomo", "state.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "pomo-state.json"
+	}
+	return filepath.Join(home, ".local", "share", "pomo", "state.json")
+}
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "pomo:", err)
-		os.Exit(1)
-	}
-}
+	addr := flag.String("addr", env("POMO_ADDR", "127.0.0.1:8080"), "listen address (POMO_ADDR)")
+	data := flag.String("data", env("POMO_DATA", defaultDataPath()), "state file (POMO_DATA)")
+	provider := flag.String("ai", env("POMO_AI", "auto"), "planner: auto, claude, codex or none (POMO_AI)")
+	model := flag.String("model", env("POMO_AI_MODEL", ""), "model passed to the planner CLI (POMO_AI_MODEL)")
+	flag.Parse()
+	password := os.Getenv("POMO_PASSWORD")
 
-const defaultFocusDuration = 40 * time.Minute
-
-func run(args []string) error {
-	if len(args) == 0 {
-		return runForeground(defaultFocusDuration)
-	}
-
-	switch args[0] {
-	case "help", "-h", "--help":
-		fmt.Print(usage)
-		return nil
-	case "start":
-		d, err := durationArg(args[1:])
-		if err != nil {
-			return err
-		}
-		s := newRunningState(d, time.Now())
-		if err := saveState(s); err != nil {
-			return err
-		}
-		fmt.Printf("Focus started: %s\n", clock(d))
-		return nil
-	case "status":
-		short := len(args) == 2 && args[1] == "--short"
-		if len(args) > 2 || (len(args) == 2 && !short) {
-			return errors.New("usage: pomo status [--short]")
-		}
-		return printStatus(short)
-	case "toggle":
-		return toggleTimer()
-	case "stop":
-		if err := deleteState(); err != nil {
-			return err
-		}
-		fmt.Println("Timer stopped.")
-		return nil
-	default:
-		d, err := parseMinutes(args[0])
-		if err != nil || len(args) != 1 {
-			return errors.New("unknown command; run 'pomo help'")
-		}
-		return runForeground(d)
-	}
-}
-
-func durationArg(args []string) (time.Duration, error) {
-	if len(args) == 0 {
-		return defaultFocusDuration, nil
-	}
-	if len(args) != 1 {
-		return 0, errors.New("usage: pomo start [MINUTES]")
-	}
-	return parseMinutes(args[0])
-}
-
-func parseMinutes(value string) (time.Duration, error) {
-	minutes, err := strconv.ParseFloat(value, 64)
-	if err != nil || minutes <= 0 {
-		return 0, errors.New("minutes must be a positive number")
-	}
-	d := time.Duration(minutes * float64(time.Minute))
-	if d < time.Second {
-		return 0, errors.New("duration must be at least one second")
-	}
-	return d, nil
-}
-
-func printStatus(short bool) error {
-	s, err := loadState()
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	store, err := OpenStore(*data)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-	remaining := s.remaining(time.Now())
-	if remaining <= 0 {
-		claimed, err := claimCompletion(time.Now())
-		if err != nil {
-			return err
-		}
-		if claimed {
-			notifyTmux()
-		}
-		if short {
-			fmt.Print("🍅 done")
-		} else {
-			fmt.Println("Focus complete!")
-		}
-		return nil
-	}
-	label := clock(remaining)
-	if short {
-		if s.Paused {
-			fmt.Printf("⏸ %s", label)
-		} else {
-			fmt.Printf("🍅 %s", label)
-		}
-		return nil
-	}
-	state := "focusing"
-	if s.Paused {
-		state = "paused"
-	}
-	fmt.Printf("%s — %s remaining\n", state, label)
-	return nil
-}
-
-func toggleTimer() error {
-	s, err := loadState()
-	if errors.Is(err, os.ErrNotExist) {
-		return errors.New("no active timer")
-	}
+	auth, err := NewAuth(password, filepath.Dir(*data))
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-	now := time.Now()
-	if s.remaining(now) <= 0 {
-		return errors.New("timer is already complete")
+	web, err := fs.Sub(webFiles, "web")
+	if err != nil {
+		log.Fatal(err)
 	}
-	if s.Paused {
-		s.End = now.Add(time.Duration(s.Remaining)).UnixNano()
-		s.Remaining = 0
-		s.Paused = false
-		fmt.Println("Timer resumed.")
-	} else {
-		s.Remaining = int64(s.remaining(now))
-		s.Paused = true
-		fmt.Println("Timer paused.")
+	if !auth.Enabled() && !isLoopback(*addr) {
+		log.Printf("WARNING: listening on %s with no POMO_PASSWORD; anyone who can reach it can run your AI CLI", *addr)
 	}
-	return saveState(s)
+
+	srv := &Server{store: store, planner: NewPlanner(*provider, *model), auth: auth, web: web}
+	log.Printf("pomo on http://%s (planner: %s, data: %s)", *addr, srv.planner.Name(), *data)
+	hs := &http.Server{
+		Addr:              *addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Fatal(hs.ListenAndServe())
 }
 
-func clock(d time.Duration) string {
-	if d < 0 {
-		d = 0
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
 	}
-	seconds := int64((d + time.Second - 1) / time.Second)
-	return fmt.Sprintf("%02d:%02d", seconds/60, seconds%60)
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

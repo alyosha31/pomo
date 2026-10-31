@@ -1,0 +1,26 @@
+# System unit that runs pomo as your own user, so it can use the Claude Code
+# (or Codex) login in that user's home directory.
+#
+#   sudo cp deploy/pomo.service /etc/systemd/system/pomo.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pomo
+[Unit]
+Description=pomo pomodoro planner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mg
+WorkingDirectory=/home/mg
+ExecStart=/home/mg/.local/bin/pomo
+# POMO_PASSWORD=... lives here (chmod 600), plus any other POMO_* overrides.
+EnvironmentFile=/home/mg/.config/pomo/env
+Environment=POMO_ADDR=127.0.0.1:8080
+# The claude/codex CLIs are node scripts installed through nvm.
+Environment=PATH=/home/mg/.nvm/versions/node/v24.21.0/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
